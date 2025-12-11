@@ -74,5 +74,4 @@ python main.py
 
 ## 💬 Ghi chú
 
-Dự án mang tính thử nghiệm, phục vụ học tập là chính.  
-Code có thể còn thay đổi hoặc chưa tối ưu.
+Dự án mang tính thử nghiệm, Code có thể còn thay đổi hoặc chưa tối ưu.
