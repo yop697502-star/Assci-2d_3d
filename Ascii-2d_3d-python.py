@@ -1512,3 +1512,962 @@ DeviceContext.draw_bitmap_masked = draw_bitmap_masked
 DeviceContext.text_out_spacing = text_out_spacing
 DeviceContext.draw_path_aa = draw_path_aa        
                                                                                 
+
+"""
+ascii_opengl45_extended.py
+Module mở rộng đầy đủ các tính năng OpenGL 4.5 còn thiếu
+Dựa trên code ASCII 3D Renderer hiện có
+"""
+
+import numpy as np
+import math
+from typing import List, Tuple, Optional, Dict, Callable
+from dataclasses import dataclass
+from enum import Enum
+import time
+from collections import deque
+
+# Import từ module gốc (giả sử đã có)
+# from ascii_3d_renderer import *
+
+# ============================================================================
+# I. COMPUTE SHADERS (Priority #1 - 5%)
+# ============================================================================
+
+class ComputeShaderASCII:
+    """
+    Compute shader cho parallel processing
+    Work groups: chia screen thành tiles để xử lý song song
+    """
+    def __init__(self, width, height, local_size_x=8, local_size_y=8):
+        self.width = width
+        self.height = height
+        self.local_size = (local_size_x, local_size_y)
+        self.work_groups_x = (width + local_size_x - 1) // local_size_x
+        self.work_groups_y = (height + local_size_y - 1) // local_size_y
+        
+        # Shared memory simulation (cho 1 work group)
+        self.shared_memory = {}
+    
+    def dispatch(self, framebuffer: 'FrameBuffer', shader_func: Callable):
+        """
+        Chạy compute shader trên toàn bộ framebuffer
+        shader_func(x, y, fb, shared_mem) -> None
+        """
+        for gy in range(self.work_groups_y):
+            for gx in range(self.work_groups_x):
+                # Clear shared memory cho work group mới
+                self.shared_memory.clear()
+                
+                # Process local work group
+                for ly in range(self.local_size[1]):
+                    for lx in range(self.local_size[0]):
+                        x = gx * self.local_size[0] + lx
+                        y = gy * self.local_size[1] + ly
+                        
+                        if x < self.width and y < self.height:
+                            shader_func(x, y, framebuffer, self.shared_memory)
+    
+    @staticmethod
+    def gaussian_blur_shader(x, y, fb, shared):
+        """Example: Gaussian blur 3x3"""
+        if 1 <= x < fb.width-1 and 1 <= y < fb.height-1:
+            kernel = np.array([[1, 2, 1],
+                              [2, 4, 2],
+                              [1, 2, 1]]) / 16.0
+            
+            total = 0
+            for dy in range(-1, 2):
+                for dx in range(-1, 2):
+                    total += fb.brightness_buffer[y+dy, x+dx] * kernel[dy+1, dx+1]
+            
+            # Write to shared memory (để tránh race condition)
+            shared[(x, y)] = total
+    
+    @staticmethod
+    def edge_detect_shader(x, y, fb, shared):
+        """Sobel edge detection"""
+        if 1 <= x < fb.width-1 and 1 <= y < fb.height-1:
+            # Sobel kernels
+            gx = (fb.brightness_buffer[y-1,x+1] + 2*fb.brightness_buffer[y,x+1] + fb.brightness_buffer[y+1,x+1] -
+                  fb.brightness_buffer[y-1,x-1] - 2*fb.brightness_buffer[y,x-1] - fb.brightness_buffer[y+1,x-1])
+            
+            gy = (fb.brightness_buffer[y+1,x-1] + 2*fb.brightness_buffer[y+1,x] + fb.brightness_buffer[y+1,x+1] -
+                  fb.brightness_buffer[y-1,x-1] - 2*fb.brightness_buffer[y-1,x] - fb.brightness_buffer[y-1,x+1])
+            
+            magnitude = math.sqrt(gx*gx + gy*gy)
+            shared[(x, y)] = min(1.0, magnitude)
+    
+    def apply_shared_to_buffer(self, framebuffer):
+        """Copy shared memory results back to buffer"""
+        for (x, y), value in self.shared_memory.items():
+            framebuffer.brightness_buffer[y, x] = value
+
+# ============================================================================
+# II. MULTI-SAMPLE ANTI-ALIASING (MSAA) - 4%
+# ============================================================================
+
+class MSAAFrameBuffer:
+    """
+    Multi-sample anti-aliasing
+    Render ở resolution cao hơn rồi downsample
+    """
+    def __init__(self, width, height, samples=4):
+        self.width = width
+        self.height = height
+        self.samples = samples  # 2x2 = 4 samples, 4x4 = 16 samples
+        
+        # Super-resolution buffers
+        scale = int(math.sqrt(samples))
+        self.super_width = width * scale
+        self.super_height = height * scale
+        
+        self.super_color = [[' ' for _ in range(self.super_width)] 
+                           for _ in range(self.super_height)]
+        self.super_depth = np.full((self.super_height, self.super_width), float('inf'))
+        self.super_brightness = np.zeros((self.super_height, self.super_width))
+    
+    def clear(self):
+        """Clear all super-resolution buffers"""
+        for y in range(self.super_height):
+            for x in range(self.super_width):
+                self.super_color[y][x] = ' '
+                self.super_depth[y, x] = float('inf')
+                self.super_brightness[y, x] = 0
+    
+    def set_super_pixel(self, x, y, char, depth, brightness):
+        """Set pixel in super-resolution buffer"""
+        if 0 <= x < self.super_width and 0 <= y < self.super_height:
+            if depth < self.super_depth[y, x]:
+                self.super_color[y][x] = char
+                self.super_depth[y, x] = depth
+                self.super_brightness[y, x] = brightness
+    
+    def resolve(self, target_fb: 'FrameBuffer'):
+        """
+        Downsample super-resolution buffer to target
+        Average brightness of samples
+        """
+        scale = int(math.sqrt(self.samples))
+        
+        for y in range(target_fb.height):
+            for x in range(target_fb.width):
+                # Average all samples in this pixel
+                total_brightness = 0
+                sample_count = 0
+                
+                for sy in range(scale):
+                    for sx in range(scale):
+                        super_x = x * scale + sx
+                        super_y = y * scale + sy
+                        if super_x < self.super_width and super_y < self.super_height:
+                            total_brightness += self.super_brightness[super_y, super_x]
+                            sample_count += 1
+                
+                if sample_count > 0:
+                    avg_brightness = total_brightness / sample_count
+                    # Convert to ASCII char
+                    from ascii_3d_renderer import Shader  # Import if needed
+                    char = Shader.get_ascii_char(avg_brightness)
+                    target_fb.set_pixel(x, y, char, 0, avg_brightness)
+
+# ============================================================================
+# III. QUERY OBJECTS - 3%
+# ============================================================================
+
+class QueryType(Enum):
+    SAMPLES_PASSED = 1  # Occlusion query
+    TIME_ELAPSED = 2    # Timestamp
+    PRIMITIVES_GENERATED = 3
+    VERTICES_SUBMITTED = 4
+
+class QueryASCII:
+    """OpenGL query objects for statistics"""
+    def __init__(self, query_type: QueryType):
+        self.type = query_type
+        self.result = 0
+        self.active = False
+        self.start_time = 0
+    
+    def begin(self):
+        """Start query"""
+        self.active = True
+        self.result = 0
+        if self.type == QueryType.TIME_ELAPSED:
+            self.start_time = time.perf_counter()
+    
+    def end(self):
+        """End query"""
+        self.active = False
+        if self.type == QueryType.TIME_ELAPSED:
+            self.result = time.perf_counter() - self.start_time
+    
+    def get_result(self):
+        """Get query result"""
+        return self.result
+    
+    def count_sample(self, depth_test_passed: bool):
+        """Count visible samples (for occlusion query)"""
+        if self.active and self.type == QueryType.SAMPLES_PASSED:
+            if depth_test_passed:
+                self.result += 1
+    
+    def count_primitive(self):
+        """Count generated primitives"""
+        if self.active and self.type == QueryType.PRIMITIVES_GENERATED:
+            self.result += 1
+    
+    def count_vertex(self):
+        """Count submitted vertices"""
+        if self.active and self.type == QueryType.VERTICES_SUBMITTED:
+            self.result += 1
+
+class PipelineStatistics:
+    """Pipeline statistics gathering"""
+    def __init__(self):
+        self.vertices_submitted = 0
+        self.vertices_processed = 0
+        self.primitives_generated = 0
+        self.fragments_written = 0
+        self.compute_invocations = 0
+    
+    def reset(self):
+        self.__init__()
+    
+    def get_stats(self) -> Dict:
+        return {
+            'vertices': self.vertices_submitted,
+            'processed': self.vertices_processed,
+            'primitives': self.primitives_generated,
+            'fragments': self.fragments_written,
+            'compute': self.compute_invocations
+        }
+
+# ============================================================================
+# IV. STENCIL BUFFER - 3%
+# ============================================================================
+
+class StencilOp(Enum):
+    KEEP = 0
+    ZERO = 1
+    REPLACE = 2
+    INCR = 3
+    DECR = 4
+    INVERT = 5
+    INCR_WRAP = 6
+    DECR_WRAP = 7
+
+class StencilFunc(Enum):
+    NEVER = 0
+    ALWAYS = 1
+    EQUAL = 2
+    NOTEQUAL = 3
+    LESS = 4
+    LEQUAL = 5
+    GREATER = 6
+    GEQUAL = 7
+
+class StencilBuffer:
+    """Stencil testing for masking effects"""
+    def __init__(self, width, height):
+        self.width = width
+        self.height = height
+        self.buffer = np.zeros((height, width), dtype=np.uint8)
+        
+        # Stencil state
+        self.enabled = False
+        self.func = StencilFunc.ALWAYS
+        self.ref = 0
+        self.mask = 0xFF
+        self.write_mask = 0xFF
+        
+        # Stencil operations
+        self.fail_op = StencilOp.KEEP
+        self.zfail_op = StencilOp.KEEP
+        self.zpass_op = StencilOp.KEEP
+    
+    def clear(self, value=0):
+        """Clear stencil buffer"""
+        self.buffer.fill(value)
+    
+    def test(self, x: int, y: int) -> bool:
+        """Test stencil value at position"""
+        if not self.enabled or not (0 <= x < self.width and 0 <= y < self.height):
+            return True
+        
+        stencil_val = self.buffer[y, x] & self.mask
+        ref_val = self.ref & self.mask
+        
+        if self.func == StencilFunc.NEVER:
+            return False
+        elif self.func == StencilFunc.ALWAYS:
+            return True
+        elif self.func == StencilFunc.EQUAL:
+            return stencil_val == ref_val
+        elif self.func == StencilFunc.NOTEQUAL:
+            return stencil_val != ref_val
+        elif self.func == StencilFunc.LESS:
+            return ref_val < stencil_val
+        elif self.func == StencilFunc.LEQUAL:
+            return ref_val <= stencil_val
+        elif self.func == StencilFunc.GREATER:
+            return ref_val > stencil_val
+        elif self.func == StencilFunc.GEQUAL:
+            return ref_val >= stencil_val
+        
+        return True
+    
+    def update(self, x: int, y: int, stencil_pass: bool, depth_pass: bool):
+        """Update stencil value based on test results"""
+        if not self.enabled or not (0 <= x < self.width and 0 <= y < self.height):
+            return
+        
+        # Determine which operation to apply
+        if not stencil_pass:
+            op = self.fail_op
+        elif not depth_pass:
+            op = self.zfail_op
+        else:
+            op = self.zpass_op
+        
+        # Apply operation
+        current = self.buffer[y, x]
+        
+        if op == StencilOp.KEEP:
+            pass
+        elif op == StencilOp.ZERO:
+            current = 0
+        elif op == StencilOp.REPLACE:
+            current = self.ref
+        elif op == StencilOp.INCR:
+            current = min(255, current + 1)
+        elif op == StencilOp.DECR:
+            current = max(0, current - 1)
+        elif op == StencilOp.INVERT:
+            current = ~current & 0xFF
+        elif op == StencilOp.INCR_WRAP:
+            current = (current + 1) & 0xFF
+        elif op == StencilOp.DECR_WRAP:
+            current = (current - 1) & 0xFF
+        
+        # Write with mask
+        self.buffer[y, x] = (current & self.write_mask) | (self.buffer[y, x] & ~self.write_mask)
+
+# ============================================================================
+# V. UNIFORM BUFFER OBJECTS (UBO) - 2%
+# ============================================================================
+
+class UniformBufferASCII:
+    """
+    Uniform Buffer Object - shared uniforms across shaders
+    Giảm overhead khi update nhiều uniforms giống nhau
+    """
+    def __init__(self, binding_point=0):
+        self.binding = binding_point
+        self.data = {}
+        self.dirty = True
+    
+    def set_mat4(self, name: str, matrix: 'Mat4'):
+        """Set matrix uniform"""
+        self.data[name] = matrix
+        self.dirty = True
+    
+    def set_vec3(self, name: str, vec: 'Vec3'):
+        """Set vec3 uniform"""
+        self.data[name] = vec
+        self.dirty = True
+    
+    def set_float(self, name: str, value: float):
+        """Set float uniform"""
+        self.data[name] = value
+        self.dirty = True
+    
+    def set_int(self, name: str, value: int):
+        """Set int uniform"""
+        self.data[name] = value
+        self.dirty = True
+    
+    def bind_to_shader(self, shader_uniforms: Dict):
+        """Bind UBO data to shader uniforms"""
+        shader_uniforms.update(self.data)
+        self.dirty = False
+    
+    def get(self, name: str):
+        """Get uniform value"""
+        return self.data.get(name)
+
+class UniformBlockASCII:
+    """
+    Uniform block manager
+    Quản lý nhiều UBOs
+    """
+    def __init__(self):
+        self.blocks: Dict[int, UniformBufferASCII] = {}
+    
+    def create_buffer(self, binding_point: int) -> UniformBufferASCII:
+        """Create new UBO at binding point"""
+        ubo = UniformBufferASCII(binding_point)
+        self.blocks[binding_point] = ubo
+        return ubo
+    
+    def bind_all_to_shader(self, shader_uniforms: Dict):
+        """Bind all UBOs to shader"""
+        for ubo in self.blocks.values():
+            if ubo.dirty:
+                ubo.bind_to_shader(shader_uniforms)
+
+# ============================================================================
+# VI. TRANSFORM FEEDBACK - 3%
+# ============================================================================
+
+class TransformFeedbackASCII:
+    """
+    Transform feedback - capture vertex shader output
+    Dùng để reuse transformed data hoặc particle systems
+    """
+    def __init__(self):
+        self.captured_vertices: List['Vertex'] = []
+        self.captured_positions: List['Vec3'] = []
+        self.active = False
+        self.mode = 'triangles'  # points, lines, triangles
+    
+    def begin(self, mode='triangles'):
+        """Start capturing"""
+        self.active = True
+        self.mode = mode
+        self.captured_vertices.clear()
+        self.captured_positions.clear()
+    
+    def end(self):
+        """Stop capturing"""
+        self.active = False
+    
+    def capture_vertex(self, vertex: 'Vertex', transformed_pos: 'Vec3'):
+        """Capture transformed vertex"""
+        if self.active:
+            self.captured_vertices.append(vertex)
+            self.captured_positions.append(transformed_pos)
+    
+    def get_captured_data(self) -> List['Vertex']:
+        """Get captured vertices"""
+        return self.captured_vertices
+    
+    def create_mesh_from_captured(self) -> 'Mesh':
+        """Create new mesh from captured data"""
+        from ascii_3d_renderer import Mesh, Triangle
+        mesh = Mesh()
+        
+        if self.mode == 'triangles':
+            for i in range(0, len(self.captured_vertices) - 2, 3):
+                tri = Triangle(
+                    self.captured_vertices[i],
+                    self.captured_vertices[i+1],
+                    self.captured_vertices[i+2]
+                )
+                mesh.triangles.append(tri)
+        
+        return mesh
+
+# ============================================================================
+# VII. TEXTURE ARRAYS - 2%
+# ============================================================================
+
+class TextureArrayASCII:
+    """
+    Texture array - multiple textures in one object
+    Efficient for terrain, sprites, etc.
+    """
+    def __init__(self, width, height, layers):
+        self.width = width
+        self.height = height
+        self.layers = layers
+        self.data = np.ones((layers, height, width))  # brightness values
+    
+    def set_layer_data(self, layer: int, data: np.ndarray):
+        """Set data for specific layer"""
+        if 0 <= layer < self.layers:
+            self.data[layer] = data
+    
+    def sample(self, u: float, v: float, layer: float) -> float:
+        """Sample texture array at UV and layer"""
+        u = u % 1.0
+        v = v % 1.0
+        layer_int = int(layer) % self.layers
+        
+        x = int(u * (self.width - 1))
+        y = int(v * (self.height - 1))
+        
+        return self.data[layer_int, y, x]
+    
+    def sample_trilinear(self, u: float, v: float, layer: float) -> float:
+        """Sample with trilinear filtering between layers"""
+        layer0 = int(layer)
+        layer1 = layer0 + 1
+        frac = layer - layer0
+        
+        if layer1 >= self.layers:
+            return self.sample(u, v, layer0)
+        
+        val0 = self.sample(u, v, layer0)
+        val1 = self.sample(u, v, layer1)
+        
+        return val0 * (1 - frac) + val1 * frac
+
+# ============================================================================
+# VIII. CUBEMAP TEXTURES - 3%
+# ============================================================================
+
+class CubemapASCII:
+    """
+    Cubemap texture for skybox, reflections, environment mapping
+    6 faces: +X, -X, +Y, -Y, +Z, -Z
+    """
+    def __init__(self, size=64):
+        self.size = size
+        self.faces = {
+            'px': np.ones((size, size)),  # Positive X
+            'nx': np.ones((size, size)),  # Negative X
+            'py': np.ones((size, size)),  # Positive Y
+            'ny': np.ones((size, size)),  # Negative Y
+            'pz': np.ones((size, size)),  # Positive Z
+            'nz': np.ones((size, size))   # Negative Z
+        }
+    
+    def set_face(self, face: str, data: np.ndarray):
+        """Set data for specific face"""
+        if face in self.faces:
+            self.faces[face] = data
+    
+    def sample(self, direction: 'Vec3') -> float:
+        """Sample cubemap using direction vector"""
+        # Normalize direction
+        d = direction.normalize()
+        abs_x, abs_y, abs_z = abs(d.x), abs(d.y), abs(d.z)
+        
+        # Select face and calculate UV
+        if abs_x >= abs_y and abs_x >= abs_z:
+            if d.x > 0:  # +X face
+                face = 'px'
+                u = (-d.z / abs_x + 1) * 0.5
+                v = (-d.y / abs_x + 1) * 0.5
+            else:  # -X face
+                face = 'nx'
+                u = (d.z / abs_x + 1) * 0.5
+                v = (-d.y / abs_x + 1) * 0.5
+        elif abs_y >= abs_x and abs_y >= abs_z:
+            if d.y > 0:  # +Y face
+                face = 'py'
+                u = (d.x / abs_y + 1) * 0.5
+                v = (d.z / abs_y + 1) * 0.5
+            else:  # -Y face
+                face = 'ny'
+                u = (d.x / abs_y + 1) * 0.5
+                v = (-d.z / abs_y + 1) * 0.5
+        else:
+            if d.z > 0:  # +Z face
+                face = 'pz'
+                u = (d.x / abs_z + 1) * 0.5
+                v = (-d.y / abs_z + 1) * 0.5
+            else:  # -Z face
+                face = 'nz'
+                u = (-d.x / abs_z + 1) * 0.5
+                v = (-d.y / abs_z + 1) * 0.5
+        
+        # Sample face
+        x = int(u * (self.size - 1))
+        y = int(v * (self.size - 1))
+        return self.faces[face][y, x]
+    
+    @staticmethod
+    def create_skybox(horizon_color=0.3, zenith_color=0.8, nadir_color=0.1):
+        """Create simple gradient skybox"""
+        cubemap = CubemapASCII(64)
+        
+        for face_name, face_data in cubemap.faces.items():
+            for y in range(cubemap.size):
+                for x in range(cubemap.size):
+                    # Simple gradient based on Y coordinate
+                    v = y / cubemap.size
+                    if face_name == 'py':  # Top (zenith)
+                        color = zenith_color
+                    elif face_name == 'ny':  # Bottom (nadir)
+                        color = nadir_color
+                    else:  # Sides
+                        color = horizon_color + (zenith_color - horizon_color) * (1 - v)
+                    
+                    face_data[y, x] = color
+        
+        return cubemap
+
+# ============================================================================
+# IX. BLEND MODES - 2%
+# ============================================================================
+
+class BlendFunc(Enum):
+    ZERO = 0
+    ONE = 1
+    SRC_COLOR = 2
+    ONE_MINUS_SRC_COLOR = 3
+    DST_COLOR = 4
+    ONE_MINUS_DST_COLOR = 5
+    SRC_ALPHA = 6
+    ONE_MINUS_SRC_ALPHA = 7
+    DST_ALPHA = 8
+    ONE_MINUS_DST_ALPHA = 9
+
+class BlendEquation(Enum):
+    ADD = 0
+    SUBTRACT = 1
+    REVERSE_SUBTRACT = 2
+    MIN = 3
+    MAX = 4
+
+class BlendState:
+    """Advanced blending state"""
+    def __init__(self):
+        self.enabled = False
+        self.src_rgb = BlendFunc.SRC_ALPHA
+        self.dst_rgb = BlendFunc.ONE_MINUS_SRC_ALPHA
+        self.src_alpha = BlendFunc.ONE
+        self.dst_alpha = BlendFunc.ZERO
+        self.equation_rgb = BlendEquation.ADD
+        self.equation_alpha = BlendEquation.ADD
+    
+    def blend_brightness(self, src: float, dst: float, src_alpha=1.0, dst_alpha=1.0) -> float:
+        """Blend two brightness values"""
+        if not self.enabled:
+            return src
+        
+        # Calculate blend factors
+        src_factor = self._get_factor(self.src_rgb, src, dst, src_alpha, dst_alpha)
+        dst_factor = self._get_factor(self.dst_rgb, src, dst, src_alpha, dst_alpha)
+        
+        # Apply equation
+        if self.equation_rgb == BlendEquation.ADD:
+            result = src * src_factor + dst * dst_factor
+        elif self.equation_rgb == BlendEquation.SUBTRACT:
+            result = src * src_factor - dst * dst_factor
+        elif self.equation_rgb == BlendEquation.REVERSE_SUBTRACT:
+            result = dst * dst_factor - src * src_factor
+        elif self.equation_rgb == BlendEquation.MIN:
+            result = min(src * src_factor, dst * dst_factor)
+        elif self.equation_rgb == BlendEquation.MAX:
+            result = max(src * src_factor, dst * dst_factor)
+        else:
+            result = src
+        
+        return max(0.0, min(1.0, result))
+    
+    def _get_factor(self, func: BlendFunc, src, dst, src_alpha, dst_alpha) -> float:
+        """Get blend factor value"""
+        if func == BlendFunc.ZERO:
+            return 0.0
+        elif func == BlendFunc.ONE:
+            return 1.0
+        elif func == BlendFunc.SRC_COLOR:
+            return src
+        elif func == BlendFunc.ONE_MINUS_SRC_COLOR:
+            return 1.0 - src
+        elif func == BlendFunc.DST_COLOR:
+            return dst
+        elif func == BlendFunc.ONE_MINUS_DST_COLOR:
+            return 1.0 - dst
+        elif func == BlendFunc.SRC_ALPHA:
+            return src_alpha
+        elif func == BlendFunc.ONE_MINUS_SRC_ALPHA:
+            return 1.0 - src_alpha
+        elif func == BlendFunc.DST_ALPHA:
+            return dst_alpha
+        elif func == BlendFunc.ONE_MINUS_DST_ALPHA:
+            return 1.0 - dst_alpha
+        return 1.0
+
+# ============================================================================
+# X. VIEWPORT ARRAYS - 2%
+# ============================================================================
+
+@dataclass
+class Viewport:
+    x: int
+    y: int
+    width: int
+    height: int
+    min_depth: float = 0.0
+    max_depth: float = 1.0
+
+class ViewportArray:
+    """Multiple viewports for split-screen rendering"""
+    def __init__(self):
+        self.viewports: List[Viewport] = []
+        self.active_viewport = 0
+    
+    def add_viewport(self, x, y, width, height, min_depth=0.0, max_depth=1.0):
+        """Add viewport"""
+        self.viewports.append(Viewport(x, y, width, height, min_depth, max_depth))
+    
+    def set_active(self, index: int):
+        """Set active viewport"""
+        if 0 <= index < len(self.viewports):
+            self.active_viewport = index
+    
+    def get_active(self) -> Viewport:
+        """Get currently active viewport"""
+        if self.viewports:
+            return self.viewports[self.active_viewport]
+        return Viewport(0, 0, 80, 40)
+    
+    def clear_all(self):
+        """Clear all viewports"""
+        self.viewports.clear()
+        self.active_viewport = 0
+    
+    @staticmethod
+    def create_split_screen_2x1(width, height):
+        """Create 2-way horizontal split"""
+        array = ViewportArray()
+        half_w = width // 2
+        array.add_viewport(0, 0, half_w, height)
+        array.add_viewport(half_w, 0, half_w, height)
+        return array
+    
+    @staticmethod
+    def create_split_screen_2x2(width, height):
+        """Create 4-way split"""
+        array = ViewportArray()
+        half_w, half_h = width // 2, height // 2
+        array.add_viewport(0, 0, half_w, half_h)          # Top-left
+        array.add_viewport(half_w, 0, half_w, half_h)    # Top-right
+        array.add_viewport(0, half_h, half_w, half_h)    # Bottom-left
+        array.add_viewport(half_w, half_h, half_w, half_h)  # Bottom-right
+        return array
+
+# ============================================================================
+# XI. CONDITIONAL RENDERING - 1%
+# ============================================================================
+
+class ConditionalRender:
+    """Conditional rendering based on query results"""
+    def __init__(self):
+        self.condition = True
+        self.mode = 'wait'  # 'wait' or 'no_wait'
+        self.query = None
+    
+    def begin_conditional(self, query: QueryASCII, mode='wait'):
+        """Start conditional rendering"""
+        self.query = query
+        self.mode = mode
+        
+        if mode == 'wait':
+            # Wait for query result
+            self.condition = query.get_result() > 0
+        else:
+            # Don't wait, use last result
+            self.condition = query.result > 0
+    
+    def end_conditional(self):
+        """End conditional rendering"""
+        self.query = None
+        self.condition = True
+    
+    def should_render(self) -> bool:
+        """Check if should render"""
+        return self.condition
+# Clip against planes: x=-w, x=+w, y=-w, y=+w, z=-w, z=+w
+def clip_triangle(tri_clip: list[Vec4]) -> list[list[Vec4]]:
+    planes = [
+        lambda v: v.x >= -v.w,
+        lambda v: v.x <=  v.w,
+        lambda v: v.y >= -v.w,
+        lambda v: v.y <=  v.w,
+        lambda v: v.z >= -v.w,
+        lambda v: v.z <=  v.w,
+    ]
+
+    poly = tri_clip
+    for inside in planes:
+        new_poly = []
+        for i in range(len(poly)):
+            a = poly[i]
+            b = poly[(i+1) % len(poly)]
+            ina, inb = inside(a), inside(b)
+            if ina and inb:
+                new_poly.append(b)
+            elif ina and not inb:
+                new_poly.append(intersect(a, b))
+            elif not ina and inb:
+                new_poly.append(intersect(a, b))
+                new_poly.append(b)
+        poly = new_poly
+        if not poly:
+            break
+    return triangulate(poly)
+def cook_torrance(N, V, L, roughness, F0):
+    H = (V + L).normalize()
+
+    NdotL = max(0, N.dot(L))
+    NdotV = max(0, N.dot(V))
+    NdotH = max(0, N.dot(H))
+    VdotH = max(0, V.dot(H))
+
+    # Normal Distribution (GGX)
+    a = roughness * roughness
+    D = a*a / (math.pi * ((NdotH*NdotH*(a*a-1)+1)**2))
+
+    # Fresnel (Schlick)
+    F = F0 + (1-F0) * ((1 - VdotH) ** 5)
+
+    # Geometry (Smith)
+    k = (roughness + 1)**2 / 8
+    Gv = NdotV / (NdotV*(1-k)+k)
+    Gl = NdotL / (NdotL*(1-k)+k)
+    G = Gv * Gl
+
+    spec = (D * F * G) / max(0.001, 4*NdotV*NdotL)
+    return spec
+    kS = F
+    kD = 1 - kS   # không vượt 1
+
+    Lo = kD * diffuse + specular       
+# ================================================================
+# ASCII DISPLAY DEVICE (TRANSFER FUNCTION)
+# ================================================================
+ASCII_PALETTE = {
+    "low":    " .'`^\",:;Il!i~",
+    "medium": "+_-?][}{1)(|\\/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao",
+    "high":   "*#MW&8%B@$",
+    "shade":  "░▒▓",
+    "block":  "▁▂▃▄▅▆▇█",
+    "dot":    "·∙•◦∘○●◉⬤",
+}
+
+def tone_map_reinhard(hdr:float)->float:
+    return hdr/(1.0+hdr)
+
+def gamma_correct(v:float,gamma=2.2)->float:
+    return pow(clamp(v),1.0/gamma)
+
+def ascii_resolve(palette:str,v:float)->str:
+    i=int(round(clamp(v)*(len(palette)-1)))
+    return palette[i]
+
+# ================================================================
+# MSAA (PER-SAMPLE DEPTH & COVERAGE)
+# ================================================================
+class MSAA:
+    def __init__(self,samples=4):
+        self.samples=samples
+        self.pattern=[(0.25,0.25),(0.75,0.25),(0.25,0.75),(0.75,0.75)]
+
+    def resolve(self,values:List[float])->float:
+        return sum(values)/len(values)
+
+# ================================================================
+# GBUFFER (DEFERRED FOUNDATION)
+# ================================================================
+class GBuffer:
+    def __init__(self,w,h,samples=4):
+        self.w=w; self.h=h; self.samples=samples
+        self.depth=[[[1e9]*samples for _ in range(w)] for __ in range(h)]
+        self.normal=[[Vec3(0,0,1) for _ in range(w)] for __ in range(h)]
+        self.albedo=[[Vec3(1,1,1) for _ in range(w)] for __ in range(h)]
+        self.rough=[[0.5]*w for _ in range(h)]
+        self.metal=[[0.0]*w for _ in range(h)]
+
+# ================================================================
+# PBR – COOK TORRANCE (SPEC CORRECT)
+# ================================================================
+def fresnel_schlick(cosTheta,F0):
+    return F0 + (1.0-F0)*pow(1.0-cosTheta,5.0)
+
+def cook_torrance(N,V,L,albedo:Vec3,rough,metal):
+    H=(V+L).normalize()
+    NdotL=clamp(N.dot(L)); NdotV=clamp(N.dot(V)); NdotH=clamp(N.dot(H)); VdotH=clamp(V.dot(H))
+
+    a=rough*rough
+    denom=(NdotH*NdotH*(a*a-1.0)+1.0)
+    D=(a*a)/(math.pi*denom*denom+1e-6)
+
+    k=(rough+1.0)**2/8.0
+    Gv=NdotV/(NdotV*(1-k)+k+1e-6)
+    Gl=NdotL/(NdotL*(1-k)+k+1e-6)
+    G=Gv*Gl
+
+    F0=Vec3(0.04,0.04,0.04)*(1-metal) + albedo*metal
+    F=fresnel_schlick(VdotH,F0.x)
+
+    spec=(D*F*G)/max(1e-6,4*NdotV*NdotL)
+    kS=F
+    kD=1.0-kS
+
+    diffuse=kD*NdotL
+    return diffuse+spec
+
+# ================================================================
+# PIPELINE BARRIER (SYNC MODEL)
+# ================================================================
+class Barrier:
+    def __init__(self,name=""):
+        self.name=name
+    def wait(self): pass
+
+# ================================================================
+# COMPUTE SHADER (WORKGROUP MODEL)
+# ================================================================
+class ComputeShader:
+    def __init__(self,local_size=(8,8)):
+        self.lsx,self.lsy=local_size
+
+    def dispatch(self,w,h,func:Callable):
+        for gy in range(0,h,self.lsy):
+            for gx in range(0,w,self.lsx):
+                shared={}
+                for ly in range(self.lsy):
+                    for lx in range(self.lsx):
+                        x=gx+lx; y=gy+ly
+                        if x<w and y<h:
+                            func(x,y,shared)
+
+# ================================================================
+# DEFERRED RENDERER
+# ================================================================
+class DeferredRenderer:
+    def __init__(self,w,h,samples=4):
+        self.w=w; self.h=h
+        self.msaa=MSAA(samples)
+        self.gbuf=GBuffer(w,h,samples)
+        self.hdr=[[0.0]*w for _ in range(h)]
+        self.out=[[" "]*w for _ in range(h)]
+
+    # Example geometry pass (normally rasterizer fills this)
+    def geometry_pass_mock(self):
+        for y in range(self.h):
+            for x in range(self.w):
+                for s in range(self.gbuf.samples):
+                    self.gbuf.depth[y][x][s]=0.5
+                self.gbuf.normal[y][x]=Vec3(0,0,1)
+                self.gbuf.albedo[y][x]=Vec3(0.8,0.7,0.6)
+                self.gbuf.rough[y][x]=0.3
+                self.gbuf.metal[y][x]=0.2
+
+    def lighting_pass(self,light=Vec3(0,0,1),view=Vec3(0,0,1)):
+        for y in range(self.h):
+            for x in range(self.w):
+                N=self.gbuf.normal[y][x]
+                a=self.gbuf.albedo[y][x]
+                r=self.gbuf.rough[y][x]
+                m=self.gbuf.metal[y][x]
+                Lo=cook_torrance(N,view,light,a,r,m)
+                self.hdr[y][x]=Lo
+
+    def resolve(self):
+        for y in range(self.h):
+            for x in range(self.w):
+                ldr=tone_map_reinhard(self.hdr[y][x])
+                g=gamma_correct(ldr)
+                palette=(ASCII_PALETTE['block'] if g>0.75 else
+                         ASCII_PALETTE['high'] if g>0.55 else
+                         ASCII_PALETTE['medium'] if g>0.3 else
+                         ASCII_PALETTE['low'])
+                self.out[y][x]=ascii_resolve(palette,g)
+        return "\n".join("".join(r) for r in self.out)
+             
