@@ -2347,13 +2347,34 @@ class MSAA:
 # GBUFFER (DEFERRED FOUNDATION)
 # ================================================================
 class GBuffer:
-    def __init__(self,w,h,samples=4):
-        self.w=w; self.h=h; self.samples=samples
-        self.depth=[[[1e9]*samples for _ in range(w)] for __ in range(h)]
-        self.normal=[[Vec3(0,0,1) for _ in range(w)] for __ in range(h)]
-        self.albedo=[[Vec3(1,1,1) for _ in range(w)] for __ in range(h)]
-        self.rough=[[0.5]*w for _ in range(h)]
-        self.metal=[[0.0]*w for _ in range(h)]
+    def __init__(self, w, h, samples=4):
+        self.w = w
+        self.h = h
+        self.samples = samples
+        self.depth = [[[1e9]*samples for _ in range(w)] for __ in range(h)]
+        self.normal = [[Vec3(0,0,1) for _ in range(w)] for __ in range(h)]
+        self.albedo = [[Vec3(1,1,1) for _ in range(w)] for __ in range(h)]
+        self.rough = [[0.5]*w for _ in range(h)]
+        self.metal = [[0.0]*w for _ in range(h)]
+
+    def clear(
+        self,
+        depth=1e9,
+        normal=Vec3(0,0,1),
+        albedo=Vec3(1,1,1),
+        rough=0.5,
+        metal=0.0
+    ):
+        for y in range(self.h):
+            for x in range(self.w):
+                # MSAA depth
+                for s in range(self.samples):
+                    self.depth[y][x][s] = depth
+
+                self.normal[y][x] = normal
+                self.albedo[y][x] = albedo
+                self.rough[y][x] = rough
+                self.metal[y][x] = metal
 # ================================================================
 # PBR – COOK TORRANCE (SPEC CORRECT)
 # ================================================================
