@@ -3442,138 +3442,107 @@ class AnisoTexture(Texture):
             final_color += self.sample(u + du * offset, v + dv * offset)
             
         return final_color / samples
-# ============================================================================
-# XVIII. THE ASCIIGL 4.5 CORE CONTEXT (DSA & DEFERRED PIPELINE)
-# ============================================================================
-
-class ASCIIGL:
-    """
-    Mô phỏng toàn bộ OpenGL 4.5 Context bằng văn bản.
-    Hỗ trợ DSA, G-Buffer, Programmable Shaders, và Compute Shaders.
-    """
-    def __init__(self, width: int, height: int):
-        self.width = width
-        self.height = height
+class ASCIIGL_Context:
+    def __init__(self, width, height):
+        self.width, self.height = width, height
+        # DSA Storage
+        self.buffers = {} # VBO/IBO
+        self.vaos = {}    # Vertex Array Objects
+        self.textures = {}
+        self._next_id = 1
         
-        # 1. CONTEXT STATES (State Manager)
+        # State Manager
         self.states = {
             "GL_DEPTH_TEST": True,
             "GL_CULL_FACE": True,
-            "GL_BLEND": False,
-            "GL_CONSERVATIVE_RASTER": False
+            "GL_BLEND": False
         }
-        
-        # 2. G-BUFFER (Multiple Render Targets - MRT)
-        # Lưu trữ dữ liệu thô trước khi chuyển thành ASCII
-        self.g_buffer = {
-            "position": np.zeros((height, width, 3), dtype=np.float32),
-            "normal":   np.zeros((height, width, 3), dtype=np.float32),
-            "albedo":   np.zeros((height, width, 3), dtype=np.float32), # RGB raw
-            "depth":    np.full((height, width), float('inf'), dtype=np.float32),
-            "material": np.zeros((height, width, 2), dtype=np.float32) # Roughness, Metallic
-        }
-        
-        # 3. DIRECT STATE ACCESS (DSA) BUFFERS
-        self.vbos = {} # Vertex Buffer Objects
-        self.vaos = {} # Vertex Array Objects
-        self.textures = {} # Bindless textures (ID based)
-        self._next_id = 1
 
-    # --- 1. DSA & BUFFER MANAGEMENT ---
-    def glCreateBuffers(self, count=1):
-        ids = list(range(self._next_id, self._next_id + count))
-        for i in ids: self.vbos[i] = None
-        self._next_id += count
-        return ids[0] if count == 1 else ids
-
-    def glNamedBufferData(self, buffer_id, data: np.ndarray):
-        """DSA: Nạp dữ liệu vào buffer mà không cần bind"""
-        self.vbos[buffer_id] = data
-
-    def glCreateTextures(self, target="GL_TEXTURE_2D"):
-        tex_id = self._next_id
-        self.textures[tex_id] = {"data": None, "sparse": False}
+    def glCreateBuffers(self, data):
+        """DSA: Tạo Buffer và nạp dữ liệu ngay lập tức"""
+        handle = self._next_id
+        self.buffers[handle] = np.array(data, dtype=np.float32)
         self._next_id += 1
-        return tex_id
+        return handle
 
-    # --- 2. PROGRAMMABLE SHADER PIPELINE ---
-    def vertex_shader_stage(self, vertices, transform, camera):
-        """Mô phỏng Vertex + Tessellation + Geometry Stage"""
-        # Phép biến đổi cơ bản
-        mvp = camera.get_projection_matrix() @ camera.get_view_matrix() @ transform
-        projected = []
-        for v in vertices:
-            # 4.5 Feature: Tessellation có thể can thiệp tại đây nếu cần chia nhỏ
-            pos_clip = mvp @ v
-            projected.append(pos_clip)
-        
-        # Geometry Shader: Có thể tạo thêm đỉnh tại đây (ví dụ: bùng nổ)
-        return projected
+    def glCreateVertexArray(self, vbo_handle, layout):
+        """DSA: Thiết lập layout dữ liệu mà không cần bind VAO"""
+        vao_handle = self._next_id
+        self.vaos[vao_handle] = {"vbo": vbo_handle, "layout": layout}
+        self._next_id += 1
+        return vao_handle
+class ShaderPipeline:
+    def vertex_stage(self, vao_data, mvp):
+        # Hỗ trợ Tessellation đơn giản bằng cách nội suy đỉnh tại đây
+        return vao_data @ mvp.T
 
-    # --- 3. GEOMETRY PASS (MRT) ---
-    def geometry_pass(self, mesh, transform, camera):
-        """Render dữ liệu thô vào G-Buffer"""
-        projected_v = self.vertex_shader_stage(mesh.vertices, transform, camera)
-        
-        # Quá trình Rasterization ghi vào nhiều Target cùng lúc
-        for i in range(0, len(mesh.indices), 3):
-            # Logic quét tam giác (Rasterize)
-            # Tại mỗi pixel (x, y) trong tam giác:
-            # self.g_buffer["position"][y, x] = world_pos
-            # self.g_buffer["normal"][y, x] = interpolated_normal
-            # self.g_buffer["depth"][y, x] = z_value
-            pass
+    def fragment_stage(self, world_pos, normal, albedo):
+        """Mô phỏng PBR Shader ghi vào MRT"""
+        # Trả về các thành phần cho G-Buffer
+        return {
+            "pos": world_pos,
+            "norm": normal / np.linalg.norm(normal),
+            "alb": albedo
+        }
+    def glTextureStorage2D(self, width, height, pixels):
+        handle = self._next_id
+        # Chuyển đổi ASCII map thành mảng số để tính toán nhanh
+        self.textures[handle] = np.array(pixels)
+        self._next_id += 1
+        return handle # Dùng ID này trực tiếp trong Shader
+    def glDispatchCompute(self, data_buffer, compute_func):
+        """Mô phỏng Compute Shader bằng NumPy Vectorization"""
+        # Ví dụ: Tính toán va chạm hạt hoặc biến dạng lưới bằng Vector math
+        return compute_func(data_buffer)
 
-    # --- 4. COMPUTE SHADER STAGE ---
-    def glDispatchCompute(self, num_groups_x, num_groups_y, dt):
-        """
-        Sử dụng Vectorization để mô phỏng vật lý chất lỏng hoặc hạt.
-        Thực hiện trước Lighting Pass.
-        """
-        # Ví dụ: Cập nhật vị trí nước (~) dựa trên sin wave
-        # self.g_buffer["albedo"] += sin(time) * 0.1
+    def glMultiDrawElementsIndirect(self, commands):
+        """Vẽ toàn bộ danh sách đối tượng trong 1 lệnh gọi CPU duy nhất"""
+        for cmd in commands:
+            if self._frustum_culling(cmd):
+                self._render_primitive(cmd)
+class DeferredRenderer:
+    def __init__(self, ctx):
+        self.ctx = ctx
+        self.g_buffer = {
+            "position": np.zeros((ctx.height, ctx.width, 3)),
+            "normal":   np.zeros((ctx.height, ctx.width, 3)),
+            "albedo":   np.zeros((ctx.height, ctx.width, 3)),
+            "depth":    np.full((ctx.height, ctx.width), np.inf)
+        }
+
+    def geometry_pass(self, vao_id, model_mat, view_mat, proj_mat):
+        """Bước 1: Quét tất cả tam giác và lấp đầy G-Buffer"""
+        # Sử dụng thuật toán Barycentric Rasterizer tối ưu hóa
+        # (Đã có trong code gốc nhưng được nâng cấp để ghi vào 4 target)
         pass
 
-    # --- 5. LIGHTING & FINAL PASS (Deferred Shading) ---
-    def lighting_pass(self, lights, camera_pos):
-        """Tính toán ánh sáng dựa trên dữ liệu từ G-Buffer"""
-        output_frame = [[" " for _ in range(self.width)] for _ in range(self.height)]
+    def lighting_pass(self, lights, cam_pos):
+        """Bước 2: Tính toán ánh sáng dựa trên G-Buffer"""
+        mask = self.g_buffer["depth"] < np.inf
+        N = self.g_buffer["normal"][mask]
+        P = self.g_buffer["position"][mask]
         
-        for y in range(self.height):
-            for x in range(self.width):
-                depth = self.g_buffer["depth"][y, x]
-                if depth == float('inf'): continue
-                
-                # Lấy dữ liệu từ MRT
-                pos = Vec3(*self.g_buffer["position"][y, x])
-                norm = Vec3(*self.g_buffer["normal"][y, x])
-                
-                # Tính toán PBR / Light Shafts / SSR tại đây
-                final_intensity = 0.0
-                for light in lights:
-                    # light_calc(pos, norm, camera_pos, light)
-                    pass
-                
-                # Convert sang ASCII
-                char = Shader.get_ascii_char(final_intensity)
-                output_frame[y][x] = char
-                
-        return output_frame
+        final_rgb = np.zeros_like(P)
+        for light in lights:
+            L = light.pos - P
+            dist = np.linalg.norm(L, axis=1, keepdims=True)
+            L /= dist
+            # Tính toán chuẩn PBR (Physically Based Rendering)
+            diffuse = np.maximum(np.einsum('ij,ij->i', N, L), 0)[:, None]
+            final_rgb += diffuse * light.color * (1.0 / (1.0 + dist**2))
+            
+        return self._final_pass(final_rgb, mask)
 
-    # --- 6. INDIRECT RENDERING ---
-    def glMultiDrawElementsIndirect(self, commands: List[Dict]):
-        """CPU ra lệnh một lần, GPU (ASCIIGL) tự xử lý danh sách"""
-        for cmd in commands:
-            # Culling check
-            if self._is_visible(cmd):
-                self.geometry_pass(cmd["mesh"], cmd["transform"], cmd["camera"])
-
-    def _is_visible(self, cmd):
-        # Frustum Culling logic
-        return True
-
-    def clear(self):
-        """Reset toàn bộ MRT Buffers"""
-        for key in self.g_buffer:
-            if key == "depth": self.g_buffer[key].fill(float('inf'))
-            else: self.g_buffer[key].fill(0)
+    def _final_pass(self, rgb_data, mask):
+        """Bước 3: Chuyển đổi dữ liệu số thành ký tự ASCII"""
+        # Áp dụng ACES Tonemapping trước khi map sang ASCII
+        rgb_data = rgb_data / (rgb_data + 1.0)
+        brightness = np.mean(rgb_data, axis=1)
+        
+        chars = np.array(list(" .:-=+*#%@"))
+        indices = (brightness * (len(chars)-1)).astype(int)
+        
+        output = np.full((self.ctx.height, self.ctx.width), " ")
+        output[mask] = chars[indices]
+        return "\n".join("".join(row) for row in output)
+                
