@@ -398,6 +398,22 @@ class Shader:
         brightness = max(0, min(1, brightness * depth_fade))
         idx = int(brightness * (len(Shader.SHADING_CHARS) - 1))
         return Shader.SHADING_CHARS[idx]
+    
+    @staticmethod
+    def acer_tonemap(color: np.ndarray) -> np.ndarray:
+        """Hàm ACES Filmic Tonemapping giúp màu sắc trông điện ảnh hơn"""
+        a = 2.51
+        b = 0.03
+        c = 2.43
+        d = 0.59
+        e = 0.14
+        return np.clip((color * (a * color + b)) / (color * (c * color + d) + e), 0, 1)
+
+    @staticmethod
+    def reinhard_tonemap(color: np.ndarray, exposure: float = 1.0) -> np.ndarray:
+        color *= exposure
+        return color / (color + 1.0)
+    
 
 # ============================================================================
 # IV. SHADOW SYSTEM
@@ -889,6 +905,66 @@ class ASCIIPipeline:
     
     def get_frame(self):
         return self.renderer.get_frame()  
+    def apply_ssao(self):
+        """Tính toán SSAO dựa trên Depth Buffer hiện tại"""
+        width, height = self.width, self.height
+        depth = self.renderer.depth_buffer
+        ssao_buffer = np.ones_like(depth)
+        
+        radius = 2 # Bán kính lấy mẫu
+        bias = 0.05
+        
+        for y in range(radius, height - radius):
+            for x in range(radius, width - radius):
+                if depth[y, x] >= 1000: continue # Bỏ qua nền xa
+                
+                occlusion = 0.0
+                current_depth = depth[y, x]
+                
+                # Lấy mẫu xung quanh pixel hiện tại
+                samples = [(x+2, y), (x-2, y), (x, y+1), (x, y-1)]
+                for sx, sy in samples:
+                    sample_depth = depth[sy, sx]
+                    if sample_depth < current_depth - bias:
+                        occlusion += 1.0
+                
+                # Giảm độ sáng của pixel dựa trên độ che khuất
+                ssao_buffer[y, x] = 1.0 - (occlusion / len(samples)) * 0.5
+        
+        # Nhân color_buffer với ssao_buffer
+        self.renderer.color_buffer *= ssao_buffer[:, :, np.newaxis]
+
+    def apply_bloom(self, threshold=0.8, intensity=0.5):
+        """Hiệu ứng Bloom: Trích xuất vùng sáng, làm mờ và cộng lại"""
+        color_buf = self.renderer.color_buffer
+        
+        # 1. Bright Pass (Trích xuất các vùng sáng hơn threshold)
+        bright_pass = np.where(color_buf > threshold, color_buf, 0)
+        
+        # 2. Simple Box Blur (Làm mờ vùng sáng - phiên bản tối ưu)
+        # Vì dùng numpy nên ta có thể shift mảng để làm mờ nhanh
+        blurred = bright_pass.copy()
+        for dx, dy in [(-1,0), (1,0), (0,-1), (0,1)]:
+            blurred += np.roll(np.roll(bright_pass, dx, axis=1), dy, axis=0)
+        blurred /= 5.0
+        
+        # 3. Additive Blending (Cộng vùng mờ vào ảnh gốc)
+        self.renderer.color_buffer += blurred * intensity
+
+    def run_post_processing(self):
+        """Điều phối các bước Post-processing"""
+        # 1. SSAO (Nên chạy trước khi Tonemap)
+        self.apply_ssao()
+        
+        # 2. Tonemapping (Chuyển dải HDR về 0-1)
+        # Áp dụng cho từng pixel
+        h, w, _ = self.renderer.color_buffer.shape
+        flat_buffer = self.renderer.color_buffer.reshape(-1, 3)
+        self.renderer.color_buffer = Shader.acer_tonemap(flat_buffer).reshape(h, w, 3)
+        
+        # 3. Bloom (Thường chạy sau khi đã có màu sắc chuẩn)
+        self.apply_bloom(threshold=0.7, intensity=0.4)
+
 # ============================================================================
 # Tessellator ASCII
 # ============================================================================
@@ -2598,13 +2674,681 @@ class ASCIISceneManager:
                 self.running = False
                 print(f"\nAn error occurred: {e}")
 
+class NormalMapModule:
+    """Mô phỏng Normal Mapping của OpenGL để tăng chi tiết bề mặt ASCII"""
+    @staticmethod
+    def calculate_tangent_space(v0, v1, v2, uv0, uv1, uv2):
+        # Tính toán vector Tangent để chuyển đổi từ không gian Texture sang không gian Thế giới
+        edge1 = v1 - v0
+        edge2 = v2 - v0
+        deltaUV1 = uv1 - uv0
+        deltaUV2 = uv2 - uv0
+
+        f = 1.0 / (deltaUV1.x * deltaUV2.y - deltaUV2.x * deltaUV1.y + 1e-6)
+        tangent = Vec3(
+            f * (deltaUV2.y * edge1.x - deltaUV1.y * edge2.x),
+            f * (deltaUV2.y * edge1.y - deltaUV1.y * edge2.y),
+            f * (deltaUV2.y * edge1.z - deltaUV1.y * edge2.z)
+        )
+        return tangent.normalize()
+
+    @staticmethod
+    def apply_normal_map(base_normal, normal_map_sample, tangent):
+        # Biến đổi normal từ texture (0->1) sang (-1->1) và áp dụng vào bề mặt
+        # Giả lập hàm texture() trong GLSL
+        map_n = (normal_map_sample * 2.0) - Vec3(1, 1, 1)
+        bitangent = base_normal.cross(tangent).normalize()
+        
+        # Ma trận TBN (Tangent, Bitangent, Normal)
+        new_normal = (tangent * map_n.x) + (bitangent * map_n.y) + (base_normal * map_n.z)
+        return new_normal.normalize()
+class GeometryProcessor:
+    """Mô phỏng Tessellation và Geometry Shaders"""
+    @staticmethod
+    def tessellate_mesh(mesh: 'Mesh', iterations: int = 1):
+        """Chia nhỏ tất cả tam giác để làm mịn vật thể ASCII"""
+        for _ in range(iterations):
+            new_indices = []
+            new_vertices = list(mesh.vertices)
+            
+            for i in range(0, len(mesh.indices), 3):
+                idx = mesh.indices
+                v0, v1, v2 = new_vertices[idx[i]], new_vertices[idx[i+1]], new_vertices[idx[i+2]]
+                
+                # Tạo các đỉnh trung điểm (Midpoints)
+                m01 = (v0 + v1) * 0.5
+                m12 = (v1 + v2) * 0.5
+                m20 = (v2 + v0) * 0.5
+                
+                start_idx = len(new_vertices)
+                new_vertices.extend([m01, m12, m20])
+                
+                # Tạo 4 tam giác mới từ 1 tam giác cũ
+                mid01, mid12, mid20 = start_idx, start_idx+1, start_idx+2
+                new_indices.extend([idx[i], mid01, mid20])
+                new_indices.extend([idx[i+1], mid12, mid01])
+                new_indices.extend([idx[i+2], mid20, mid12])
+                new_indices.extend([mid01, mid12, mid20])
+            
+            mesh.vertices = new_vertices
+            mesh.indices = new_indices
+
+    @staticmethod
+    def explode_effect(mesh: 'Mesh', magnitude: float):
+        """Hiệu ứng Geometry Shader: Đẩy các tam giác ra xa tâm của chúng"""
+        for i in range(0, len(mesh.indices), 3):
+            idx = mesh.indices
+            # Tính pháp tuyến của tam giác
+            v0, v1, v2 = mesh.vertices[idx[i]], mesh.vertices[idx[i+1]], mesh.vertices[idx[i+2]]
+            center_normal = (v1 - v0).cross(v2 - v0).normalize()
+            
+            # Đẩy các đỉnh theo hướng pháp tuyến
+            mesh.vertices[idx[i]] += center_normal * magnitude
+            mesh.vertices[idx[i+1]] += center_normal * magnitude
+            mesh.vertices[idx[i+2]] += center_normal * magnitude
+class GeometryProcessor:
+    """Mô phỏng Tessellation và Geometry Shaders"""
+    @staticmethod
+    def tessellate_mesh(mesh: 'Mesh', iterations: int = 1):
+        """Chia nhỏ tất cả tam giác để làm mịn vật thể ASCII"""
+        for _ in range(iterations):
+            new_indices = []
+            new_vertices = list(mesh.vertices)
+            
+            for i in range(0, len(mesh.indices), 3):
+                idx = mesh.indices
+                v0, v1, v2 = new_vertices[idx[i]], new_vertices[idx[i+1]], new_vertices[idx[i+2]]
+                
+                # Tạo các đỉnh trung điểm (Midpoints)
+                m01 = (v0 + v1) * 0.5
+                m12 = (v1 + v2) * 0.5
+                m20 = (v2 + v0) * 0.5
+                
+                start_idx = len(new_vertices)
+                new_vertices.extend([m01, m12, m20])
+                
+                # Tạo 4 tam giác mới từ 1 tam giác cũ
+                mid01, mid12, mid20 = start_idx, start_idx+1, start_idx+2
+                new_indices.extend([idx[i], mid01, mid20])
+                new_indices.extend([idx[i+1], mid12, mid01])
+                new_indices.extend([idx[i+2], mid20, mid12])
+                new_indices.extend([mid01, mid12, mid20])
+            
+            mesh.vertices = new_vertices
+            mesh.indices = new_indices
+
+    @staticmethod
+    def explode_effect(mesh: 'Mesh', magnitude: float):
+        """Hiệu ứng Geometry Shader: Đẩy các tam giác ra xa tâm của chúng"""
+        for i in range(0, len(mesh.indices), 3):
+            idx = mesh.indices
+            # Tính pháp tuyến của tam giác
+            v0, v1, v2 = mesh.vertices[idx[i]], mesh.vertices[idx[i+1]], mesh.vertices[idx[i+2]]
+            center_normal = (v1 - v0).cross(v2 - v0).normalize()
+            
+            # Đẩy các đỉnh theo hướng pháp tuyến
+            mesh.vertices[idx[i]] += center_normal * magnitude
+            mesh.vertices[idx[i+1]] += center_normal * magnitude
+            mesh.vertices[idx[i+2]] += center_normal * magnitude
+class PBRShaderModule:
+    """Mô phỏng Physically Based Rendering (PBR) cho ký tự ASCII"""
+    @staticmethod
+    def fresnel_schlick(cos_theta, f0):
+        return f0 + (Vec1(1.0) - f0) * pow(max(1.0 - cos_theta, 0.0), 5.0)
+
+    @staticmethod
+    def distribution_ggx(n, h, roughness):
+        a = roughness * roughness
+        a2 = a * a
+        n_dot_h = max(n.dot(h), 0.0)
+        n_dot_h2 = n_dot_h * n_dot_h
+        
+        num = a2
+        denom = (n_dot_h2 * (a2 - 1.0) + 1.0)
+        return num / (math.pi * denom * denom + 1e-6)
+
+    def calculate_pbr_intensity(self, normal, view_dir, light_dir, roughness, metallic):
+        h = (view_dir + light_dir).normalize()
+        f0 = Vec3(0.04, 0.04, 0.04) # Dielectric cơ bản
+        # Giả lập màu kim loại nếu metallic cao
+        
+        ndf = self.distribution_ggx(normal, h, roughness)
+        f = self.fresnel_schlick(max(h.dot(view_dir), 0.0), f0)
+        
+        # Kết quả trả về một giá trị float để map vào bảng ASCII
+        specular = (ndf * f.x) / 4.0 
+        diffuse = max(normal.dot(light_dir), 0.0)
+        
+        return diffuse + specular
 # ============================================================================
-# EXECUTION EXAMPLE
+# XII. VOLUMETRIC LIGHTING (GOD RAYS)
 # ============================================================================
 
-# if __name__ == "__main__":
-#     # Khởi tạo và chạy
-#     # scene_manager = ASCIISceneManager(width=120, height=40)
-#     # scene_manager.run_scene()
-#     pass
-             
+class VolumetricLight:
+    """
+    Mô phỏng Light Shafts (God Rays) bằng kỹ thuật Radial Blur trong Screen Space.
+    Chạy sau khi render scene xong nhưng trước khi xuất ra màn hình.
+    """
+    def __init__(self, decay=0.9, exposure=0.4, density=0.8, weight=0.4, samples=8):
+        self.decay = decay          # Độ giảm sáng khi đi xa tâm
+        self.exposure = exposure    # Độ phơi sáng tổng thể
+        self.density = density      # Mật độ các tia sáng (độ gần nhau của mẫu)
+        self.weight = weight        # Trọng số màu sắc
+        self.samples = samples      # Số lượng mẫu raymarching (càng cao càng mượt nhưng chậm)
+
+    def apply(self, renderer: 'Renderer', light_world_pos: 'Vec3', camera: 'Camera'):
+        """
+        Áp dụng hiệu ứng God Rays lên framebuffer hiện tại.
+        """
+        # 1. Tính vị trí nguồn sáng trên màn hình (World -> Clip -> Screen)
+        view = camera.get_view_matrix()
+        proj = camera.get_projection_matrix()
+        vp = proj @ view
+        
+        # Project light position
+        clip_pos = vp @ light_world_pos
+        
+        # Nếu nguồn sáng nằm sau camera (w < 0), không vẽ tia sáng
+        if clip_pos.w <= 0:
+            return
+
+        ndc_x = clip_pos.x / clip_pos.w
+        ndc_y = clip_pos.y / clip_pos.w
+        
+        # Map NDC (-1..1) sang Screen Coordinates (0..width/height)
+        light_x = (ndc_x + 1) * 0.5 * renderer.width
+        light_y = (1 - ndc_y) * 0.5 * renderer.height # Flip Y nếu cần tùy hệ toạ độ
+
+        # Kiểm tra nếu nguồn sáng quá xa ngoài màn hình thì bỏ qua để tối ưu
+        margin = 50
+        if not (-margin <= light_x <= renderer.width + margin and -margin <= light_y <= renderer.height + margin):
+            return
+
+        # 2. Raymarching Loop (Radial Blur)
+        # Tối ưu: Chỉ quét vùng bị ảnh hưởng (ở đây quét toàn màn hình cho đơn giản)
+        width, height = renderer.width, renderer.height
+        brightness_buf = renderer.framebuffer.brightness_buffer
+        depth_buf = renderer.framebuffer.depth_buffer
+        
+        # Buffer tạm để tính ánh sáng thể tích
+        delta_u = 1.0 / width
+        delta_v = 1.0 / height
+        
+        # Chuyển toạ độ đèn sang UV (0..1)
+        light_uv_x = light_x / width
+        light_uv_y = light_y / height
+
+        for y in range(height):
+            for x in range(width):
+                # UV hiện tại
+                uv_x = x / width
+                uv_y = y / height
+                
+                # Vector hướng từ pixel hiện tại về phía đèn
+                delta_x = (uv_x - light_uv_x)
+                delta_y = (uv_y - light_uv_y)
+                
+                # Scale vector bước nhảy
+                delta_x *= self.density / self.samples
+                delta_y *= self.density / self.samples
+                
+                illumination_decay = 1.0
+                accumulated_light = 0.0
+                
+                cur_uv_x = uv_x
+                cur_uv_y = uv_y
+                
+                # Raymarching
+                for _ in range(self.samples):
+                    cur_uv_x -= delta_x
+                    cur_uv_y -= delta_y
+                    
+                    # Sample depth tại vị trí ray
+                    sample_x = int(cur_uv_x * width)
+                    sample_y = int(cur_uv_y * height)
+                    
+                    if 0 <= sample_x < width and 0 <= sample_y < height:
+                        # Logic Occlusion:
+                        # Nếu pixel đó là bầu trời (depth vô cực) -> Nguồn phát sáng
+                        # Nếu pixel đó là vật thể -> Chặn sáng
+                        is_occluded = depth_buf[sample_y, sample_x] < 1000.0 # Ngưỡng depth xa
+                        
+                        if not is_occluded:
+                            sample_val = 1.0 # Ánh sáng mạnh từ bầu trời
+                        else:
+                            sample_val = 0.0 # Bị chặn
+                            
+                        sample_val *= illumination_decay * self.weight
+                        accumulated_light += sample_val
+                        illumination_decay *= self.decay
+                
+                # Cộng dồn ánh sáng vào buffer gốc
+                final_light = accumulated_light * self.exposure
+                if final_light > 0.05:
+                    renderer.framebuffer.brightness_buffer[y, x] += final_light
+                    # Cập nhật lại ký tự hiển thị dựa trên độ sáng mới
+                    new_bright = renderer.framebuffer.brightness_buffer[y, x]
+                    # Giữ nguyên độ sâu cũ, chỉ đổi ký tự
+                    char = Shader.get_ascii_char(new_bright)
+                    renderer.framebuffer.color_buffer[y][x] = char
+# ============================================================================
+# XIII. PARALLAX OCCLUSION MAPPING (POM)
+# ============================================================================
+
+class HeightMap(Texture):
+    """Texture đặc biệt chứa thông tin độ cao (Height/Depth Map)"""
+    def sample_height(self, u, v):
+        # Giả sử texture là grayscale, lấy kênh R làm độ cao
+        col = self.sample(u, v)
+        return col.x
+
+class POMCalculator:
+    """
+    Tính toán Parallax Occlusion Mapping.
+    Sử dụng trong Rasterizer trước khi lấy màu từ Texture.
+    """
+    @staticmethod
+    def get_parallax_coords(current_uv: 'Vec2', view_dir_tangent: 'Vec3', 
+                           height_map: 'HeightMap', height_scale=0.1, min_layers=8, max_layers=32):
+        """
+        Trả về toạ độ UV mới đã được dịch chuyển để tạo ảo giác độ sâu.
+        view_dir_tangent: Vector hướng nhìn trong không gian Tangent (TBN).
+        """
+        # Nếu nhìn vuông góc, ít lớp mẫu hơn. Nhìn nghiêng cần nhiều mẫu hơn.
+        num_layers =  min_layers + (max_layers - min_layers) * abs(view_dir_tangent.z) # Z trong tangent space là pháp tuyến
+        if num_layers < min_layers: num_layers = min_layers
+        
+        layer_depth = 1.0 / num_layers
+        current_layer_depth = 0.0
+        
+        # P: Vector dịch chuyển UV trên mỗi lớp
+        # view_dir_tangent.xy chia cho view_dir_tangent.z để project xuống mặt phẳng texture
+        p = Vec2(view_dir_tangent.x, view_dir_tangent.y) * (height_scale / (view_dir_tangent.z + 1e-6))
+        delta_tex_coords = p * (1.0 / num_layers)
+        
+        current_tex_coords = current_uv
+        current_depth_map_value = height_map.sample_height(current_tex_coords.x, current_tex_coords.y)
+        
+        # Vòng lặp Raymarching tìm giao điểm
+        while current_layer_depth < current_depth_map_value:
+            current_tex_coords = current_tex_coords - delta_tex_coords
+            current_depth_map_value = height_map.sample_height(current_tex_coords.x, current_tex_coords.y)
+            current_layer_depth += layer_depth
+        
+        # Parallax Occlusion (Interpolation bước cuối cùng để mượt hơn)
+        prev_tex_coords = current_tex_coords + delta_tex_coords
+        after_depth = current_depth_map_value - current_layer_depth
+        before_depth = height_map.sample_height(prev_tex_coords.x, prev_tex_coords.y) - (current_layer_depth - layer_depth)
+        
+        weight = after_depth / (after_depth - before_depth + 1e-6)
+        final_tex_coords = prev_tex_coords * weight + current_tex_coords * (1.0 - weight)
+        
+        return final_tex_coords
+
+    @staticmethod
+    def calculate_tbn_matrix(normal: 'Vec3', tangent: 'Vec3'):
+        """Tạo ma trận chuyển đổi từ World sang Tangent Space"""
+        # Gram-Schmidt orthogonalization
+        t = (tangent - normal * normal.dot(tangent)).normalize()
+        b = normal.cross(t).normalize() # Bitangent
+        
+        # Ma trận TBN (cột là T, B, N)
+        # Để chuyển vector sang Tangent Space, ta dùng ma trận chuyển vị của TBN
+        return Mat4(np.array([
+            [t.x, b.x, normal.x, 0],
+            [t.y, b.y, normal.y, 0],
+            [t.z, b.z, normal.z, 0],
+            [0,   0,   0,        1]
+        ]).T) # Transpose cho rotation matrix nghịch đảo
+# ============================================================================
+# XIV. MULTI-DRAW INDIRECT (MDI) & BATCHING
+# ============================================================================
+
+@dataclass
+class DrawCommand:
+    mesh: 'Mesh'
+    transform: 'Mat4'
+    bounding_radius: float = 1.0 # Dùng cho culling
+
+class IndirectDrawBuffer:
+    """
+    Quản lý danh sách các lệnh vẽ gián tiếp.
+    Tối ưu hóa việc render nhiều vật thể giống nhau hoặc khác nhau.
+    """
+    def __init__(self):
+        self.commands: List[DrawCommand] = []
+    
+    def add_command(self, mesh: 'Mesh', transform: 'Mat4', radius=1.0):
+        self.commands.append(DrawCommand(mesh, transform, radius))
+    
+    def clear(self):
+        self.commands.clear()
+
+    def frustum_cull(self, camera: 'Camera', cmd: DrawCommand) -> bool:
+        """
+        Kiểm tra đơn giản xem vật thể có nằm trong tầm nhìn camera không.
+        (Sphere-Frustum intersection test đơn giản hóa)
+        """
+        # Lấy vị trí thế giới của vật thể
+        pos_vec4 = cmd.transform @ Vec3(0,0,0) # Center
+        pos = Vec3(pos_vec4.x, pos_vec4.y, pos_vec4.z)
+        
+        # Vector từ camera đến vật thể
+        to_obj = pos - camera.position
+        
+        # 1. Khoảng cách (Far/Near plane)
+        dist = to_obj.length()
+        if dist < camera.near - cmd.bounding_radius or dist > camera.far + cmd.bounding_radius:
+            return False
+            
+        # 2. Góc nhìn (FOV check - Dot product)
+        # Chỉ kiểm tra nếu vật thể ở xa một chút
+        if dist > cmd.bounding_radius * 2:
+            forward = (camera.target - camera.position).normalize()
+            angle_cos = forward.dot(to_obj.normalize())
+            # Giả sử FOV ~ 60-90 độ, cos ~ 0.5
+            if angle_cos < 0.5: # Góc > 60 độ
+                return False
+                
+        return True
+
+    def execute(self, renderer: 'Renderer', camera: 'Camera'):
+        """
+        Thực thi tất cả các lệnh vẽ trong buffer.
+        Tự động loại bỏ vật thể ngoài tầm nhìn (Culling).
+        """
+        drawn_count = 0
+        
+        # Pre-calculate View/Proj matrix
+        view = camera.get_view_matrix()
+        proj = camera.get_projection_matrix()
+        
+        for cmd in self.commands:
+            # GPU Culling simulation
+            if not self.frustum_cull(camera, cmd):
+                continue
+                
+            # Render Mesh
+            # Lưu ý: Ta cần gán transform tạm thời cho mesh hoặc truyền thẳng
+            # Để tránh sửa core renderer, ta clone mesh biến đổi (shallow copy vertices referenece)
+            # Cách tối ưu hơn: Renderer.render nhận thêm tham số model_matrix
+            
+            # Tính MVP
+            mvp = proj @ view @ cmd.transform
+            
+            # Gọi hàm rasterize trực tiếp (bỏ qua bước transform mesh vertices trên CPU nếu có thể)
+            # Ở đây ta dùng hàm render có sẵn, gán đè transform
+            original_transform = cmd.mesh.transform
+            cmd.mesh.transform = cmd.transform
+            
+            # Render
+            renderer.render(cmd.mesh)
+            
+            # Restore
+            cmd.mesh.transform = original_transform
+            drawn_count += 1
+            
+        return drawn_count
+class AdvancedSceneManager(ASCIISceneManager):
+    def __init__(self, width=120, height=40):
+        super().__init__(width, height)
+        
+        # 1. Setup Volumetric
+        self.god_rays = VolumetricLight(decay=0.95, weight=0.4, density=0.8, samples=15)
+        
+        # 2. Setup Indirect Draw Buffer (MDI)
+        self.mdi_buffer = IndirectDrawBuffer()
+        
+        # Tạo 20 khối lập phương ngẫu nhiên
+        import random
+        for _ in range(20):
+            x = random.uniform(-10, 10)
+            z = random.uniform(-10, 0) # Phía trước camera
+            y = random.uniform(-2, 2)
+            
+            t = Mat4.translation(x, y, z)
+            # Thêm vào buffer vẽ gián tiếp
+            self.mdi_buffer.add_command(self.cube_mesh, t, radius=1.5)
+
+    def _render_3d(self):
+        self.pipeline.clear()
+        
+        # --- PHASE 1: INDIRECT DRAW (Geometry Pass) ---
+        # Thay vì vẽ thủ công, ta gọi lệnh execute buffer
+        # Nó sẽ tự động Culling những khối ở xa
+        drawn = self.mdi_buffer.execute(self.pipeline.renderer, self.camera)
+        
+        # --- PHASE 2: VOLUMETRIC LIGHTING (Post-Process) ---
+        # Áp dụng God Rays từ nguồn sáng chính
+        self.god_rays.apply(self.pipeline.renderer, self.light.position, self.camera)
+        
+        # Hiển thị số lượng vật thể thực tế được vẽ (Debug Culling)
+        # Có thể vẽ text này lên overlay sau
+        pass 
+# ============================================================================
+# XV. SHADER STORAGE BUFFER OBJECT (SSBO) & PARTICLE SYSTEM
+# ============================================================================
+
+@dataclass
+class Particle:
+    position: Vec3
+    velocity: Vec3
+    life: float
+    color: str # Ký tự đại diện: '*', '.', '|'
+
+class SSBO:
+    """
+    Shader Storage Buffer Object: Chứa dữ liệu lớn có thể đọc/ghi bởi Compute Shader
+    """
+    def __init__(self, data: List[Particle]):
+        self.data = data # Mảng các Particle
+
+class ParticleSystem:
+    """
+    Mô phỏng GPU Particle System sử dụng Compute Shader logic
+    """
+    def __init__(self, count=100, area=10.0):
+        self.count = count
+        # Khởi tạo hạt ngẫu nhiên
+        import random
+        particles = []
+        for _ in range(count):
+            p = Particle(
+                position=Vec3(random.uniform(-area, area), random.uniform(5, 15), random.uniform(-area, area)),
+                velocity=Vec3(0, -0.5, 0), # Rơi xuống
+                life=random.uniform(0.5, 1.0),
+                color='|' if random.random() > 0.5 else '.'
+            )
+            particles.append(p)
+        self.ssbo = SSBO(particles)
+
+    def compute_update(self, dt: float, floor_y=0.0):
+        """
+        Giả lập Compute Shader: Update song song (dùng numpy nếu muốn nhanh hơn)
+        """
+        for p in self.ssbo.data:
+            # Update Physics
+            p.position = p.position + p.velocity * dt * 5.0
+            p.life -= dt * 0.1
+            
+            # Reset nếu chạm đất hoặc hết đời
+            if p.position.y < floor_y or p.life <= 0:
+                import random
+                p.position.y = random.uniform(10, 15)
+                p.position.x = random.uniform(-10, 10)
+                p.position.z = random.uniform(-10, 0)
+                p.life = 1.0
+
+    def render(self, renderer: 'Renderer', view_proj: 'Mat4'):
+        """
+        Render điểm (Point Rendering)
+        """
+        for p in self.ssbo.data:
+            # Project to screen
+            pos_clip = view_proj @ p.position
+            if pos_clip.w <= 0: continue
+            
+            ndc_x = pos_clip.x / pos_clip.w
+            ndc_y = pos_clip.y / pos_clip.w
+            
+            screen_x = int((ndc_x + 1) * 0.5 * renderer.width)
+            screen_y = int((1 - ndc_y) * 0.5 * renderer.height)
+            
+            # Z-Test đơn giản
+            if 0 <= screen_x < renderer.width and 0 <= screen_y < renderer.height:
+                dist = pos_clip.w
+                if dist < renderer.framebuffer.depth_buffer[screen_y, screen_x]:
+                    # Vẽ đè lên
+                    renderer.framebuffer.color_buffer[screen_y][screen_x] = p.color
+                    # Không update depth buffer vì hạt thường trong suốt (soft particles)
+# ============================================================================
+# XVI. HIERARCHICAL Z-BUFFER (Hi-Z)
+# ============================================================================
+
+class HiZBuffer:
+    """
+    Tạo tháp Mipmap cho Depth Buffer.
+    Dùng để kiểm tra nhanh xem một Bounding Box có bị che khuất không.
+    """
+    def __init__(self, depth_buffer: np.ndarray):
+        self.mips = [depth_buffer]
+        self._generate_mips()
+
+    def _generate_mips(self):
+        """Downsample depth buffer: Lấy giá trị MAX depth cho mỗi ô 2x2"""
+        current = self.mips[0]
+        h, w = current.shape
+        
+        while w > 1 and h > 1:
+            new_w, new_h = w // 2, h // 2
+            # Reshape để xử lý block 2x2
+            # Cắt bớt nếu lẻ
+            curr_crop = current[:new_h*2, :new_w*2]
+            reshaped = curr_crop.reshape(new_h, 2, new_w, 2)
+            # Lấy max depth trong 4 pixel con (Conservative Rasterization)
+            # OpenGL dùng Max cho Far plane (ngược lại nếu dùng reverse-Z)
+            # Ở engine này depth càng nhỏ càng gần, nên ta lấy MAX (xa nhất) của block
+            # Nếu vật thể xa hơn cái XA NHẤT của block nền, nghĩa là nó bị che khuất hoàn toàn?
+            # KHÔNG: Để an toàn (occlusion), ta cần MIN depth của block nền.
+            # Nếu vật thể gần nhất (min z) của bounding box > max z (xa nhất) của nền -> Không bị che
+            # Nếu vật thể xa hơn (min z > max z nền) -> Chưa chắc.
+            
+            # Logic đúng cho Hi-Z Culling (Standard Depth < is closer):
+            # Mipmap lưu giá trị depth XA NHẤT (Max) trong vùng đó.
+            # Nếu điểm GẦN NHẤT của vật thể > Giá trị Max của vùng -> Bị che khuất.
+            next_mip = reshaped.max(axis=(1, 3))
+            
+            self.mips.append(next_mip)
+            current = next_mip
+            w, h = new_w, new_h
+
+    def is_occluded(self, min_x, min_y, max_x, max_y, min_z):
+        """
+        Kiểm tra hình chữ nhật màn hình (rect) ở độ sâu min_z có bị che khuất không.
+        """
+        # 1. Chọn mip level phù hợp với kích thước rect
+        level = 0
+        w = max_x - min_x
+        h = max_y - min_y
+        
+        # Tìm level sao cho rect chỉ chiếm khoảng 4 texels
+        while level < len(self.mips) - 1 and (w > 2 or h > 2):
+            w //= 2
+            h //= 2
+            min_x //= 2
+            min_y //= 2
+            max_x //= 2
+            max_y //= 2
+            level += 1
+            
+        # 2. Lấy mẫu depth từ mipmap
+        mip = self.mips[level]
+        mh, mw = mip.shape
+        
+        # Kiểm tra 4 góc (hoặc vùng) trong mipmap
+        # Đơn giản hóa: kiểm tra mẫu tại trung tâm
+        cx = min(mw-1, (min_x + max_x) // 2)
+        cy = min(mh-1, (min_y + max_y) // 2)
+        
+        max_depth_in_screen = mip[cy, cx]
+        
+        # Nếu điểm gần nhất của vật thể (min_z) còn XA HƠN điểm xa nhất của nền
+        # -> Vật thể nằm hoàn toàn phía sau bức tường.
+        # Lưu ý: Engine này dùng depth < là gần, depth > là xa.
+        # Depth buffer khởi tạo là inf.
+        
+        # Cần logic ngược lại cho engine này:
+        # Buffer lưu bề mặt GẦN NHẤT đã vẽ.
+        # Nếu muốn cull, ta cần so sánh với bề mặt đó.
+        pass # Logic Hi-Z phức tạp, tạm thời return False để an toàn
+        return False
+# ============================================================================
+# XVII. FORWARD+ TILED LIGHTING
+# ============================================================================
+
+class TiledLighting:
+    """
+    Chia màn hình thành các ô (Tiles), mỗi ô chứa danh sách đèn ảnh hưởng tới nó.
+    Giảm số lượng đèn phải tính toán cho mỗi pixel.
+    """
+    TILE_SIZE = 8 # 8x8 pixels ascii
+    
+    def __init__(self, width, height):
+        self.width = width
+        self.height = height
+        self.cols = (width + self.TILE_SIZE - 1) // self.TILE_SIZE
+        self.rows = (height + self.TILE_SIZE - 1) // self.TILE_SIZE
+        # Grid lưu index các đèn: [row][col] -> [light_index1, light_index2...]
+        self.light_grid = [[[] for _ in range(self.cols)] for _ in range(self.rows)]
+
+    def cull_lights(self, lights: List['Light'], camera: 'Camera'):
+        """
+        Compute Shader Pass: Phân loại đèn vào các ô.
+        """
+        view = camera.get_view_matrix()
+        proj = camera.get_projection_matrix()
+        vp = proj @ view
+        
+        # Clear grid cũ
+        for r in range(self.rows):
+            for c in range(self.cols):
+                self.light_grid[r][c].clear()
+                
+        for i, light in enumerate(lights):
+            # 1. Project đèn lên màn hình
+            # Với Point Light, ta cần project cả bounding sphere của nó
+            # Đơn giản hóa: Chỉ kiểm tra tâm đèn (không chính xác hoàn toàn nhưng nhanh)
+            pos_clip = vp @ light.position
+            if pos_clip.w <= 0: continue # Đèn sau camera
+            
+            ndc_x = pos_clip.x / pos_clip.w
+            ndc_y = pos_clip.y / pos_clip.w
+            
+            screen_x = (ndc_x + 1) * 0.5 * self.width
+            screen_y = (1 - ndc_y) * 0.5 * self.height
+            
+            # 2. Tính bán kính ảnh hưởng trên màn hình (ước lượng)
+            # Radius ~ Intensity / depth
+            radius_screen = (light.intensity * 5.0) / pos_clip.w 
+            
+            # 3. Tìm các tile bị ảnh hưởng (AABB check 2D)
+            min_tx = int((screen_x - radius_screen) / self.TILE_SIZE)
+            max_tx = int((screen_x + radius_screen) / self.TILE_SIZE)
+            min_ty = int((screen_y - radius_screen) / self.TILE_SIZE)
+            max_ty = int((screen_y + radius_screen) / self.TILE_SIZE)
+            
+            min_tx = max(0, min_tx); max_tx = min(self.cols-1, max_tx)
+            min_ty = max(0, min_ty); max_ty = min(self.rows-1, max_ty)
+            
+            for ty in range(min_ty, max_ty + 1):
+                for tx in range(min_tx, max_tx + 1):
+                    self.light_grid[ty][tx].append(light)
+
+    def get_lights_for_pixel(self, x, y):
+        """Lấy danh sách đèn đã được tối ưu cho pixel này"""
+        tx = x // self.TILE_SIZE
+        ty = y // self.TILE_SIZE
+        if 0 <= tx < self.cols and 0 <= ty < self.rows:
+            return self.light_grid[ty][tx]
+        return []
+   
